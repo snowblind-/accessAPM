@@ -1,0 +1,87 @@
+## Rule: Mock-credential-based auth for SWG-Explicit (forward proxy) APM Basic
+## Author: kevin@f5.com
+## Version: 3, 02/2020
+## Function: Creates a mechanism to deploy APM Basic auth with credential-based auth behavior. APM NTLM is the only
+##           WIA auth method auth that currently supports credential-based auth - ability to persist on the authenticated
+##           user. Kerberos and Basic persist on the source IP, which is probelematic in NAT environments. This solution
+##           uses a clientless-mode access policy evaluation to validate Basic credentials against a directory service, and
+##           requires the client to pass a valid authorization header in every request. The solution is optimized to query
+##           the directory service once for an authenticated user (and within expiry time).
+## Instructions: 
+## - Create an SWG-Explicit auth policy without 407, passing directly to directory service auth agent
+## - Attach this iRule to the SSLO -xp interception rule
+## - Modify the AUTH_PROFILE variable to reflect the name of the SWG-Explicit auth policy
+## - Modify the BASIC_REALM variable to reflect the correct Basic realm information
+## - Modify the AUTH_SESSION_TIMER variable to reflect needed to store "authenticated" user (shorter times more secure, but validate more often)
+
+when RULE_INIT {
+    ## user-defined: name of the APM authentication profile
+    set static::AUTH_PROFILE "/Common/swg-e-mock-basic-localdb-auth"
+
+    ## user-defined: Basic realm
+    set static::BASIC_REALM "Test"
+    
+    ## user-defined: Amount of time to maintain the authenticated user session (in seconds) - 300 seconds = 5 min
+    set static::AUTH_SESSION_TIMER 300
+    
+    ## user-defined: authentication logging (1-on/0-off)
+    set static::AUTH_LOGGING 1
+}
+
+## NO NEED TO MODIFY BEYOND THIS POINT ##
+
+proc SEND_AUTH_REQUEST { } {
+    ## Set up HTTP Basic 407 response
+    HTTP::respond 407 Proxy-Authenticate "Basic Realm=\"$static::BASIC_REALM\"" "Connection" "close" "Cache-Control" "no-cache, must-revalidate" "Pragma" "no-cache" "X-Frame-Options" "DENY" "Content-Type" "text/html; charset=utf-8"
+
+    ## stop further rule processing
+    return
+}
+when HTTP_PROXY_REQUEST priority 750 {
+    ## This is done at priority 750 to navigate around the existing SSLO XP rules
+
+    if { not ( [HTTP::header exists "Proxy-Authorization"] ) or not ( [HTTP::header "Proxy-Authorization"] starts_with "Basic " )  } {
+        ## No Proxy-Authorization received, irrespective of auth_flag - send 407 and reset auth_flag
+        call SEND_AUTH_REQUEST
+    } else {
+        ## Generate the lookup key
+        set pa [findstr [HTTP::header "Proxy-Authorization"] "Basic " 6]
+        set key "[IP::client_addr]:${pa}"
+
+        ## Perform lookup in auth table based on client key: "[IP]:[Proxy-Authorization header]"
+        if { [table lookup ${key}] ne "1" } {
+            ## auth table not 1 (empty) (new or previous failed request) - perform auth validation inside catch incase base64 is bad
+            if { [catch {
+                ## create flow_sid access session (with short timeout/lifespan)
+                set flow_sid [ACCESS::session create -timeout 1 -lifetime 1]            
+            
+                ## Extract username/password from Proxy-Authorization header
+                set proxyauth [lindex [split [HTTP::header value "Proxy-Authorization"] " "] 1]
+                set username [lindex [split [b64decode $proxyauth] ":"] 0 ]
+                set password [lindex [split [b64decode $proxyauth] ":"] 1 ]
+                ## Call clientless-mode access policy with supplied username/password
+                ACCESS::policy evaluate -sid ${flow_sid} -profile $static::AUTH_PROFILE session.logon.last.username ${username} session.logon.last.password ${password}
+                switch [ACCESS::policy result -sid ${flow_sid}] {
+                    "allow" {
+                        if { $static::AUTH_LOGGING } { log local0. "Authentication succeeded for user($username) at ip([IP::client_addr])" }
+                        ## set auth table to 1 to prevent subsequent auth validations on successfully auth'ed requests per TCP connection
+                        table set ${key} 1 $static::AUTH_SESSION_TIMER
+                    }
+                    "deny" {
+                        ## Authentication failed - send 407 and reset auth_flag
+                        if { $static::AUTH_LOGGING } { log local0. "Authentication failed for user($username) at ip([IP::client_addr])" }
+                        call SEND_AUTH_REQUEST
+                    }
+                    default {
+                        ## Authentication failed - send 407 and reset auth_flag
+                        if { $static::AUTH_LOGGING } { log local0. "Authentication outcome unknown for user($username) at ip([IP::client_addr]), Error: [ACCESS::policy result -sid ${flow_sid}]"}
+                        call SEND_AUTH_REQUEST
+                    }
+                }
+            } err] } {
+                ## Proxy-Authorization decode failed - send 407
+                call SEND_AUTH_REQUEST
+            }
+        } 
+    }
+}
